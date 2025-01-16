@@ -319,12 +319,11 @@ async fn tunnel(upgraded: Upgraded, addr: String, state: AppState) -> std::io::R
     let (from_client, from_server) =
         tokio::io::copy_bidirectional(&mut upgraded, &mut server).await?;
 
-    state
-        .metrics_service
-        .update_bandwidth(from_client + from_server);
+    state.metrics_service.update_bandwidth(from_client);
+    state.metrics_service.update_bandwidth(from_server);
 
     tracing::info!(
-        "Transfer completed - Client bytes: {}, Server bytes: {}, Total: {}",
+        "Transfer completed - Upload bytes: {}, Download bytes: {}, Total: {}",
         from_client,
         from_server,
         from_client + from_server
@@ -353,13 +352,50 @@ async fn proxy_http(
         }
     }
 
-    let client = Client::builder(TokioExecutor::new()).build_http();
+    let mut request_size = 0u64;
 
+    request_size += req.method().as_str().len() as u64;
+    request_size += req.uri().to_string().len() as u64;
+    request_size += "HTTP/1.1\r\n".len() as u64;
+
+    for (name, value) in req.headers() {
+        request_size += name.as_str().len() as u64;
+        request_size += value.len() as u64;
+        request_size += 4;
+    }
+
+    let (parts, body) = req.into_parts();
+    let bytes = body
+        .collect()
+        .await
+        .expect("Failed to read request body")
+        .to_bytes();
+    request_size += bytes.len() as u64;
+
+    state.metrics_service.update_bandwidth(request_size);
+
+    req = Request::from_parts(parts, Body::from(bytes));
+
+    let client = Client::builder(TokioExecutor::new()).build_http();
     let response = client.request(req).await.expect("Failed to send request");
+
+    let mut response_size = 0u64;
+
+    response_size += "HTTP/1.1 ".len() as u64;
+    response_size += response.status().as_str().len() as u64;
+    response_size += "\r\n".len() as u64;
+
+    for (name, value) in response.headers() {
+        response_size += name.as_str().len() as u64;
+        response_size += value.len() as u64;
+        response_size += 4;
+    }
 
     let (parts, body) = response.into_parts();
     let bytes = body.collect().await?.to_bytes();
-    state.metrics_service.update_bandwidth(bytes.len() as u64);
+    response_size += bytes.len() as u64;
+
+    state.metrics_service.update_bandwidth(response_size);
 
     Ok(Response::from_parts(parts, Body::from(bytes)))
 }
