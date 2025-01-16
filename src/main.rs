@@ -361,8 +361,9 @@ async fn proxy_http(
     for (name, value) in req.headers() {
         request_size += name.as_str().len() as u64;
         request_size += value.len() as u64;
-        request_size += 4;
+        request_size += 4; // ": " = "\r\n"
     }
+    request_size += 2; // "\r\n"
 
     let (parts, body) = req.into_parts();
     let bytes = body
@@ -383,13 +384,14 @@ async fn proxy_http(
 
     response_size += "HTTP/1.1 ".len() as u64;
     response_size += response.status().as_str().len() as u64;
-    response_size += "\r\n".len() as u64;
+    response_size += 4; // ": " = "\r\n"
 
     for (name, value) in response.headers() {
         response_size += name.as_str().len() as u64;
         response_size += value.len() as u64;
-        response_size += 4;
+        response_size += 4; // ": " = "\r\n"
     }
+    response_size += 2; // "\r\n"
 
     let (parts, body) = response.into_parts();
     let bytes = body.collect().await?.to_bytes();
