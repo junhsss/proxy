@@ -13,7 +13,7 @@ use std::sync::OnceLock;
 
 use dashmap::DashMap;
 use humansize::{format_size, BINARY};
-use hyper::{body::Incoming, upgrade::Upgraded};
+use hyper::{body::Incoming, upgrade::Upgraded, HeaderMap, Uri};
 use hyper_util::rt::TokioIo;
 use serde::Serialize;
 use std::{
@@ -269,6 +269,34 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+fn calculate_http_header_size(method: &str, uri: &str, headers: &HeaderMap) -> u64 {
+    let mut size = 0u64;
+
+    // Request/response line
+    size += method.len() as u64;
+    size += uri.len() as u64;
+    size += " HTTP/1.1\r\n".len() as u64;
+
+    // Headers
+    for (name, value) in headers {
+        size += name.as_str().len() as u64;
+        size += value.len() as u64;
+        size += 4; // ": " and "\r\n"
+    }
+    size += 2; // Final "\r\n"
+
+    size
+}
+
+fn calculate_connect_request_size(uri: &Uri, headers: &HeaderMap) -> u64 {
+    calculate_http_header_size("CONNECT", &uri.to_string(), headers)
+}
+
+fn calculate_http_response_size(status: StatusCode, headers: &HeaderMap) -> u64 {
+    let status_line = format!("HTTP/1.1 {}", status.as_str());
+    calculate_http_header_size(&status_line, "", headers)
+}
+
 #[tracing::instrument(skip(req))]
 async fn proxy_https(req: Request<Body>, state: AppState) -> Result<Response<Body>, hyper::Error> {
     let host_addr = match req.uri().authority().map(|auth| auth.to_string()) {
@@ -292,6 +320,12 @@ async fn proxy_https(req: Request<Body>, state: AppState) -> Result<Response<Bod
         .to_string();
 
     state.metrics_service.update_site_visit(domain);
+
+    let request_size = calculate_connect_request_size(req.uri(), req.headers());
+    state.metrics_service.update_bandwidth(request_size);
+
+    let response_size = calculate_http_response_size(StatusCode::OK, &HeaderMap::new());
+    state.metrics_service.update_bandwidth(response_size);
 
     let state_clone = state.clone();
 
@@ -347,18 +381,8 @@ async fn proxy_http(req: Request<Body>, state: AppState) -> Result<Response<Body
 
     state.metrics_service.update_site_visit(host.to_string());
 
-    let mut request_size = 0u64;
-    request_size += req.method().as_str().len() as u64;
-    request_size += req.uri().to_string().len() as u64;
-    request_size += "HTTP/1.1\r\n".len() as u64;
-
-    for (name, value) in req.headers() {
-        request_size += name.as_str().len() as u64;
-        request_size += value.len() as u64;
-        request_size += 4; // ": " and "\r\n"
-    }
-    request_size += 2; // Final "\r\n"
-
+    let request_size =
+        calculate_http_header_size(req.method().as_str(), &req.uri().to_string(), req.headers());
     state.metrics_service.update_bandwidth(request_size);
 
     let server = TcpStream::connect(&addr)
@@ -367,7 +391,6 @@ async fn proxy_http(req: Request<Body>, state: AppState) -> Result<Response<Body
 
     let server = TokioIo::new(server);
 
-    // Set up the connection
     let (mut sender, conn) = hyper::client::conn::http1::handshake(server).await?;
 
     tokio::task::spawn(async move {
@@ -376,7 +399,6 @@ async fn proxy_http(req: Request<Body>, state: AppState) -> Result<Response<Body
         }
     });
 
-    // Track request body
     let (parts, body) = req.into_parts();
     let state_clone = state.clone();
     let tracked_body = Body::from_stream(body.into_data_stream().map(move |chunk| {
@@ -389,25 +411,11 @@ async fn proxy_http(req: Request<Body>, state: AppState) -> Result<Response<Body
     }));
     let tracked_req = Request::from_parts(parts, tracked_body);
 
-    // Send request and get response
     let response = sender.send_request(tracked_req).await?;
 
-    // Track response metadata size
-    let mut response_size = 0u64;
-    response_size += "HTTP/1.1 ".len() as u64;
-    response_size += response.status().as_str().len() as u64;
-    response_size += 2; // "\r\n"
-
-    for (name, value) in response.headers() {
-        response_size += name.as_str().len() as u64;
-        response_size += value.len() as u64;
-        response_size += 4; // ": " and "\r\n"
-    }
-    response_size += 2; // Final "\r\n"
-
+    let response_size = calculate_http_response_size(response.status(), response.headers());
     state.metrics_service.update_bandwidth(response_size);
 
-    // Track response body
     let (parts, body) = response.into_parts();
     let state_clone = state.clone();
     let tracked_body = Body::from_stream(body.into_data_stream().map(move |chunk| {
