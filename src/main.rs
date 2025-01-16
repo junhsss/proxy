@@ -149,7 +149,6 @@ impl AppState {
     }
 }
 
-#[axum::debug_handler]
 async fn metrics_handler(State(state): State<AppState>) -> Json<Metrics> {
     let metrics = state.metrics_service.get_metrics().await;
 
@@ -178,7 +177,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let body = Body::from_stream(stream);
             let req = Request::from_parts(parts, body);
 
-            if req.uri().scheme().is_none() && req.uri().path().starts_with("/metrics") {
+            if req.uri().scheme().is_none() {
                 return app.oneshot(req).await.map_err(|err| match err {});
             }
 
@@ -332,6 +331,7 @@ async fn tunnel(upgraded: Upgraded, addr: String, state: AppState) -> std::io::R
     Ok(())
 }
 
+#[tracing::instrument(skip(req))]
 async fn proxy_http(
     mut req: Request<Body>,
     state: AppState,
