@@ -7,12 +7,16 @@ use axum::{
     Json, Router,
 };
 use base64::{engine::general_purpose::STANDARD, Engine};
+use http_body_util::BodyExt;
 use std::sync::OnceLock;
 
 use dashmap::DashMap;
 use humansize::{format_size, BINARY};
 use hyper::{body::Incoming, upgrade::Upgraded};
-use hyper_util::rt::TokioIo;
+use hyper_util::{
+    client::legacy::Client,
+    rt::{TokioExecutor, TokioIo},
+};
 use serde::Serialize;
 use std::{
     net::SocketAddr,
@@ -164,20 +168,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/metrics", get(metrics_handler))
         .with_state(state.clone());
 
-    let tower_service = tower::service_fn(move |req: Request<_>| {
+    let tower_service = tower::service_fn(move |req: Request<Incoming>| {
         let app = app.clone();
         let state = state.clone();
-        let req = req.map(Body::new);
 
         async move {
+            let (parts, incoming_body) = req.into_parts();
+            let stream = incoming_body.into_data_stream();
+            let body = Body::from_stream(stream);
+            let req = Request::from_parts(parts, body);
+
+            if req.uri().scheme().is_none() && req.uri().path().starts_with("/metrics") {
+                return app.oneshot(req).await.map_err(|err| match err {});
+            }
+
+            if let Err(auth_error) = authorize(&req) {
+                return Ok(auth_error);
+            }
+
             match *req.method() {
-                Method::CONNECT => {
-                    if let Err(auth_error) = authorize(&req) {
-                        return Ok(auth_error);
-                    }
-                    proxy(req, state).await
-                }
-                _ => app.oneshot(req).await.map_err(|err| match err {}),
+                Method::CONNECT => proxy_https(req, state).await,
+                _ => proxy_http(req, state).await,
             }
         }
     });
@@ -262,7 +273,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 #[tracing::instrument(skip(req))]
-async fn proxy(req: Request<Body>, state: AppState) -> Result<Response<Body>, hyper::Error> {
+async fn proxy_https(req: Request<Body>, state: AppState) -> Result<Response<Body>, hyper::Error> {
     let host_addr = match req.uri().authority().map(|auth| auth.to_string()) {
         Some(addr) => addr,
         None => {
@@ -319,6 +330,40 @@ async fn tunnel(upgraded: Upgraded, addr: String, state: AppState) -> std::io::R
         from_client + from_server
     );
     Ok(())
+}
+
+async fn proxy_http(
+    mut req: Request<Body>,
+    state: AppState,
+) -> Result<Response<Body>, hyper::Error> {
+    let uri = match req.uri().to_string() {
+        ref uri if uri.starts_with("http://") => uri.to_string(),
+        _ => {
+            return Ok(Response::builder()
+                .status(StatusCode::BAD_REQUEST)
+                .body(Body::from("Invalid proxy request"))
+                .unwrap());
+        }
+    };
+
+    if let Ok(url) = url::Url::parse(&uri) {
+        if let Some(domain) = url.host_str() {
+            state.metrics_service.update_site_visit(domain.to_string());
+        }
+    }
+
+    let client = Client::builder(TokioExecutor::new()).build_http();
+
+    req.headers_mut().remove("proxy-authorization");
+    req.headers_mut().remove("proxy-connection");
+
+    let response = client.request(req).await.expect("Failed to send request");
+
+    let (parts, body) = response.into_parts();
+    let bytes = body.collect().await?.to_bytes();
+    state.metrics_service.update_bandwidth(bytes.len() as u64);
+
+    Ok(Response::from_parts(parts, Body::from(bytes)))
 }
 
 // Authentication
