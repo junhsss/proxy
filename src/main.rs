@@ -7,15 +7,15 @@ use axum::{
     Json, Router,
 };
 use base64::{engine::general_purpose::STANDARD, Engine};
+use dashmap::DashMap;
 use futures_util::StreamExt;
 use http_body_util::BodyExt;
-use std::sync::OnceLock;
-
-use dashmap::DashMap;
 use humansize::{format_size, BINARY};
+use hyper::server::conn::http1;
 use hyper::{body::Incoming, upgrade::Upgraded, HeaderMap, Uri};
 use hyper_util::rt::TokioIo;
 use serde::Serialize;
+use std::sync::OnceLock;
 use std::{
     net::SocketAddr,
     sync::{
@@ -23,15 +23,12 @@ use std::{
         Arc,
     },
 };
-
 use tokio::{
     net::{TcpListener, TcpStream},
     signal,
 };
 use tower::{Service, ServiceExt};
 use tracing_subscriber::EnvFilter;
-
-use hyper::server::conn::http1;
 
 #[derive(Serialize)]
 pub struct Metrics {
