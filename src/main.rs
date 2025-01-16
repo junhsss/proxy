@@ -177,7 +177,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let body = Body::from_stream(stream);
             let req = Request::from_parts(parts, body);
 
-            if req.uri().scheme().is_none() {
+            if req.uri().authority().is_none() {
                 return app.oneshot(req).await.map_err(|err| match err {});
             }
 
@@ -292,6 +292,7 @@ async fn proxy_https(req: Request<Body>, state: AppState) -> Result<Response<Bod
         .next()
         .unwrap_or(&host_addr)
         .to_string();
+
     state.metrics_service.update_site_visit(domain);
 
     let state_clone = state.clone();
@@ -353,9 +354,6 @@ async fn proxy_http(
     }
 
     let client = Client::builder(TokioExecutor::new()).build_http();
-
-    req.headers_mut().remove("proxy-authorization");
-    req.headers_mut().remove("proxy-connection");
 
     let response = client.request(req).await.expect("Failed to send request");
 
