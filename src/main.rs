@@ -73,7 +73,7 @@ impl DefaultMetricsService {
 
         top_sites.sort_by(|a, b| b.1.cmp(&a.1));
 
-        let mut output = format!("\nFinal Metrics:\n============\n");
+        let mut output = "\nFinal Metrics:\n============\n".to_string();
         output.push_str(&format!(
             "Total Bandwidth Usage: {}\n",
             format_size(bandwidth, BINARY)
@@ -85,6 +85,12 @@ impl DefaultMetricsService {
         }
 
         output
+    }
+}
+
+impl Default for DefaultMetricsService {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -185,11 +191,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     tracing::info!("Server started on {}", addr);
 
-    // Create a shutdown channel
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::broadcast::channel(1);
     let shutdown_tx_clone = shutdown_tx.clone();
 
-    // Spawn signal handler task
     tokio::spawn(async move {
         match signal::ctrl_c().await {
             Ok(()) => {
@@ -244,10 +248,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
-    // Wait for shutdown signal
     server_task.await?;
 
-    // Get and print final metrics
     let final_metrics = metrics_service.get_metrics().await;
     println!("\nFinal Server Statistics:");
     println!("Total Bandwidth Usage: {}", final_metrics.bandwidth_usage);
@@ -357,10 +359,10 @@ fn authorize(req: &Request<Body>) -> Result<(), Response<Body>> {
         .headers()
         .get("Proxy-Authorization")
         .and_then(|h| h.to_str().ok())
-        .ok_or_else(|| unauthorized_response())?;
+        .ok_or_else(unauthorized_response)?;
 
     let (username, provided_password) =
-        decode_basic_auth(auth_str).ok_or_else(|| unauthorized_response())?;
+        decode_basic_auth(auth_str).ok_or_else(unauthorized_response)?;
 
     match get_credentials().get(&username) {
         Some(stored_password) if stored_password.as_str() == provided_password => Ok(()),
