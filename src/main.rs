@@ -7,16 +7,14 @@ use axum::{
     Json, Router,
 };
 use base64::{engine::general_purpose::STANDARD, Engine};
+use futures_util::StreamExt;
 use http_body_util::BodyExt;
 use std::sync::OnceLock;
 
 use dashmap::DashMap;
 use humansize::{format_size, BINARY};
 use hyper::{body::Incoming, upgrade::Upgraded};
-use hyper_util::{
-    client::legacy::Client,
-    rt::{TokioExecutor, TokioIo},
-};
+use hyper_util::rt::TokioIo;
 use serde::Serialize;
 use std::{
     net::SocketAddr,
@@ -331,11 +329,7 @@ async fn tunnel(upgraded: Upgraded, addr: String, state: AppState) -> std::io::R
     Ok(())
 }
 
-#[tracing::instrument(skip(req))]
-async fn proxy_http(
-    mut req: Request<Body>,
-    state: AppState,
-) -> Result<Response<Body>, hyper::Error> {
+async fn proxy_http(req: Request<Body>, state: AppState) -> Result<Response<Body>, hyper::Error> {
     let uri = match req.uri().to_string() {
         ref uri if uri.starts_with("http://") => uri.to_string(),
         _ => {
@@ -346,14 +340,14 @@ async fn proxy_http(
         }
     };
 
-    if let Ok(url) = url::Url::parse(&uri) {
-        if let Some(domain) = url.host_str() {
-            state.metrics_service.update_site_visit(domain.to_string());
-        }
-    }
+    let url = url::Url::parse(&uri).expect("Failed to parse URL");
+    let host = url.host_str().expect("Failed to get host").to_string();
+    let port = url.port().unwrap_or(80);
+    let addr = format!("{}:{}", host, port);
+
+    state.metrics_service.update_site_visit(host.to_string());
 
     let mut request_size = 0u64;
-
     request_size += req.method().as_str().len() as u64;
     request_size += req.uri().to_string().len() as u64;
     request_size += "HTTP/1.1\r\n".len() as u64;
@@ -361,45 +355,77 @@ async fn proxy_http(
     for (name, value) in req.headers() {
         request_size += name.as_str().len() as u64;
         request_size += value.len() as u64;
-        request_size += 4; // ": " = "\r\n"
+        request_size += 4; // ": " and "\r\n"
     }
-    request_size += 2; // "\r\n"
-
-    let (parts, body) = req.into_parts();
-    let bytes = body
-        .collect()
-        .await
-        .expect("Failed to read request body")
-        .to_bytes();
-    request_size += bytes.len() as u64;
+    request_size += 2; // Final "\r\n"
 
     state.metrics_service.update_bandwidth(request_size);
 
-    req = Request::from_parts(parts, Body::from(bytes));
+    let server = TcpStream::connect(&addr)
+        .await
+        .expect("Failed to connect to server");
 
-    let client = Client::builder(TokioExecutor::new()).build_http();
-    let response = client.request(req).await.expect("Failed to send request");
+    let server = TokioIo::new(server);
 
+    // Set up the connection
+    let (mut sender, conn) = hyper::client::conn::http1::handshake(server).await?;
+
+    tokio::task::spawn(async move {
+        if let Err(err) = conn.await {
+            tracing::error!("Connection failed: {:?}", err);
+        }
+    });
+
+    // Track request body
+    let (parts, body) = req.into_parts();
+    let state_clone = state.clone();
+    let tracked_body = Body::from_stream(body.into_data_stream().map(move |chunk| {
+        if let Ok(data) = &chunk {
+            state_clone
+                .metrics_service
+                .update_bandwidth(data.len() as u64);
+        }
+        chunk
+    }));
+    let tracked_req = Request::from_parts(parts, tracked_body);
+
+    // Send request and get response
+    let response = sender.send_request(tracked_req).await?;
+
+    // Track response metadata size
     let mut response_size = 0u64;
-
     response_size += "HTTP/1.1 ".len() as u64;
     response_size += response.status().as_str().len() as u64;
-    response_size += 4; // ": " = "\r\n"
+    response_size += 2; // "\r\n"
 
     for (name, value) in response.headers() {
         response_size += name.as_str().len() as u64;
         response_size += value.len() as u64;
-        response_size += 4; // ": " = "\r\n"
+        response_size += 4; // ": " and "\r\n"
     }
-    response_size += 2; // "\r\n"
-
-    let (parts, body) = response.into_parts();
-    let bytes = body.collect().await?.to_bytes();
-    response_size += bytes.len() as u64;
+    response_size += 2; // Final "\r\n"
 
     state.metrics_service.update_bandwidth(response_size);
 
-    Ok(Response::from_parts(parts, Body::from(bytes)))
+    // Track response body
+    let (parts, body) = response.into_parts();
+    let state_clone = state.clone();
+    let tracked_body = Body::from_stream(body.into_data_stream().map(move |chunk| {
+        if let Ok(data) = &chunk {
+            state_clone
+                .metrics_service
+                .update_bandwidth(data.len() as u64);
+
+            tracing::debug!(
+                "Response chunk size: {} bytes, domain: {}",
+                data.len(),
+                host
+            );
+        }
+        chunk
+    }));
+
+    Ok(Response::from_parts(parts, tracked_body))
 }
 
 // Authentication
